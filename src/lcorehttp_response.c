@@ -131,8 +131,8 @@ l_corehttp_response_read(lua_State* L) {
         return 1;
     }
     size_t bytesRead = 0;
-    HTTPStatus_t returnStatus =
-        HTTPClient_Read(response->transport, &response->response, buffer, bufferLen - preloadedBytesToUse, &bytesRead);
+    HTTPStatus_t returnStatus = HTTPClient_Read(response->transport, &response->response, buffer + preloadedBytesToUse,
+                                                bufferLen - preloadedBytesToUse, &bytesRead);
     if (returnStatus != HTTPSuccess) {
         return push_error(L, "Failed to read response body.");
     }

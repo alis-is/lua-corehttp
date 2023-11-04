@@ -109,5 +109,5 @@ HTTPClient_Read(const TransportInterface_t* pTransport, HTTPResponse_t* pRespons
 HTTPStatus_t
 HTTPClient_Write(const TransportInterface_t* pTransport, HTTPClient_GetCurrentTimeFunc_t getTimestampMs,
                  const uint8_t* pData, size_t dataLen) {
-    return HTTPClient_InternalSendHttpData(pTransport, getTimestampMs, pData, dataLen);
+    return HTTPClient_SendHttpData(pTransport, getTimestampMs, pData, dataLen);
 }

@@ -358,8 +358,8 @@ l_corehttp_client_request(lua_State* L) {
         return push_error_status(L, response->status);
     }
 
-    response->status = HTTPClient_InternalSendHttpHeaders(transportInterface, response->response.getTime,
-                                                          &requestHeaders, body_len, sendFlags);
+    response->status = HTTPClient_SendHttpHeaders(transportInterface, response->response.getTime, &requestHeaders,
+                                                  body_len, sendFlags);
     if (response->status != HTTPSuccess) {
         return push_error_status(L, response->status);
     }
@@ -386,8 +386,11 @@ l_corehttp_client_request(lua_State* L) {
         lua_pop(L, 1);
     }
 
-    response->status =
-        HTTPClient_InternalReceiveAndParseHttpResponse(transportInterface, &response->response, &requestHeaders);
+    response->status = HTTPClient_ReceiveAndParseHttpResponse(transportInterface, &response->response, &requestHeaders);
+    if (response->status == HTTPInsufficientMemory
+        && response->response.areHeadersComplete) { // headers are complete, we can read the body later
+        response->status = HTTPSuccess;
+    }
     response->strStatus = HTTPClient_strerror(response->status);
     response->contentLength = response->response.contentLength;
 
