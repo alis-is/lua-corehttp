@@ -11,8 +11,8 @@ typedef struct lcorehttp_response {
     HTTPStatus_t status;
     const char* strStatus;
     const TransportInterface_t* transport;
-    size_t bodyBytesRead;
     size_t contentLength;
+    uint8_t cachedBodyRead;
     int isChunked;
 } lcorehttp_response;
 

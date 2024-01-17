@@ -21,6 +21,7 @@ l_corehttp_new_response(lua_State* L) {
     memset(response, 0, sizeof(lcorehttp_response));
     response->response.getTime = l_corehttp_get_time_ms;
     response->contentLength = -1;
+    response->cachedBodyRead = 0;
     return response;
 }
 
@@ -93,53 +94,49 @@ l_corehttp_response_read(lua_State* L) {
         bufferLen = lua_tointeger(L, 2);
     }
 
-    if (response->contentLength == 0 && response->isChunked == 0) {
+    if (bufferLen <= 0) {
+        return 0;
+    }
+
+    if (response->contentLength == 0 && !response->isChunked) {
         return 0; // no body
     }
 
-    if (response->isChunked) {
-        // TODO: chunked
-        return push_error(L, "chunked response bodies are not yet supported.");
-    } else if (response->contentLength >= 0) {
-        if (response->bodyBytesRead >= response->contentLength) {
-            return 0;
+
+    if (!response->cachedBodyRead) {
+        const uint8_t* body = (const uint8_t*)response->response.pBody;
+        // skip `\r\n\r\n`, `\r\n\n`, `\n\r\n`, and `\n\n` - end of headers
+        if (response->response.bodyLen >= 4 && memcmp(body, "\r\n\r\n", 4) == 0) {
+            body += 4;
+        } else if (response->response.bodyLen >= 3 && memcmp(body, "\r\n\n", 3) == 0) {
+            body += 3;
+        } else if (response->response.bodyLen >= 3 && memcmp(body, "\n\r\n", 3) == 0) {
+            body += 3;
+        } else if (response->response.bodyLen >= 2 && memcmp(body, "\n\n", 2) == 0) {
+            body += 2;
         }
-        if (response->bodyBytesRead + bufferLen > response->contentLength) {
-            bufferLen = response->contentLength - response->bodyBytesRead;
-        }
-    } else {
-        return push_error(L, "Response body is neither chunked nor has a content length.");
-    }
-    if ((bufferLen <= 0) || (response->bodyBytesRead >= response->contentLength)) {
-        return 0;
+
+        response->cachedBodyRead = 1;
+
+        size_t bytesRead = response->response.bodyLen - (body - response->response.pBody);
+        lua_pushlstring(L, (const char*)body, bytesRead);
+        lua_pushinteger(L, bytesRead);
+        return 2;
     }
 
     luaL_buffinit(L, &b);
     uint8_t* buffer = (uint8_t*)luaL_prepbuffsize(&b, bufferLen);
-    // first load preloaded body in response buffer
-    size_t availablePreloadedBytes =
-        response->bodyBytesRead < response->response.bodyLen ? response->response.bodyLen - response->bodyBytesRead : 0;
-
-    size_t preloadedBytesToUse = availablePreloadedBytes > bufferLen ? bufferLen : availablePreloadedBytes;
-    if (preloadedBytesToUse > 0) {
-        memcpy(buffer, response->response.pBody + response->bodyBytesRead, preloadedBytesToUse);
-        luaL_addsize(&b, preloadedBytesToUse);
-        response->bodyBytesRead += preloadedBytesToUse;
-    }
-    if (bufferLen - preloadedBytesToUse == 0) {
-        luaL_pushresult(&b);
-        return 1;
-    }
     size_t bytesRead = 0;
-    HTTPStatus_t returnStatus = HTTPClient_Read(response->transport, &response->response, buffer + preloadedBytesToUse,
-                                                bufferLen - preloadedBytesToUse, &bytesRead);
+    HTTPStatus_t returnStatus =
+        HTTPClient_Read(response->transport, &response->response, buffer, bufferLen, &bytesRead);
     if (returnStatus != HTTPSuccess) {
-        return push_error(L, "Failed to read response body.");
+        return push_error(L, "failed to read response body");
     }
 
     luaL_addsize(&b, bytesRead);
     luaL_pushresult(&b);
-    return 1;
+    lua_pushinteger(L, bytesRead);
+    return 2;
 }
 
 int

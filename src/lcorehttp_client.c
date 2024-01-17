@@ -349,6 +349,7 @@ l_corehttp_client_request(lua_State* L) {
     response->transport = transportInterface;
     response->response.pBuffer = requestHeaders.pBuffer; // reuse buffer for response
     response->response.bufferLen = requestHeaders.bufferLen;
+    response->response.respOptionFlags = HTTP_RESPONSE_DO_NOT_PARSE_BODY_FLAG;
 
     lua_newtable(L); // for headers
     response->response.pHeaderParsingCallback = &headerParsingCallback;
@@ -387,7 +388,7 @@ l_corehttp_client_request(lua_State* L) {
     }
 
     response->status = HTTPClient_ReceiveAndParseHttpResponse(transportInterface, &response->response, &requestHeaders);
-    if (response->status == HTTPInsufficientMemory
+    if ((response->status == HTTPInsufficientMemory || response->status == HTTPPartialResponse)
         && response->response.areHeadersComplete) { // headers are complete, we can read the body later
         response->status = HTTPSuccess;
     }
