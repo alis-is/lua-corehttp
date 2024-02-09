@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include "logging.h"
 
-#define HTTP_USER_AGENT_VALUE "lua-corehttp"
+#define HTTP_USER_AGENT_VALUE "eli/0.32.0-dev.17"
 // #define HTTP_RECV_RETRY_TIMEOUT_MS 1U
 // #define DEBUG_COREHTTP        1
 

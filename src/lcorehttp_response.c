@@ -102,7 +102,6 @@ l_corehttp_response_read(lua_State* L) {
         return 0; // no body
     }
 
-
     if (!response->cachedBodyRead) {
         const uint8_t* body = (const uint8_t*)response->response.pBody;
         // skip `\r\n\r\n`, `\r\n\n`, `\n\r\n`, and `\n\n` - end of headers
@@ -177,7 +176,7 @@ l_corehttp_response_headers_get(lua_State* L) {
     const char* headerName = luaL_checkstring(L, 2);
 
     lua_pushnil(L);
-    while (lua_next(L, -2) != 0) {
+    while (lua_next(L, 1) != 0) {
         const char* key = lua_tostring(L, -2);
         if (strcasecmp(key, headerName) == 0) {
             return 1;
@@ -190,14 +189,12 @@ l_corehttp_response_headers_get(lua_State* L) {
 int
 l_corehttp_response_headers_create_meta(lua_State* L) {
     luaL_newmetatable(L, LCOREHTTP_HEADERS_METATABLE);
-    /* Metamethods */
-    lua_newtable(L);
+
     lua_pushcfunction(L, l_corehttp_response_headers_get);
     lua_setfield(L, -2, "__index");
+
     lua_pushstring(L, LCOREHTTP_HEADERS_METATABLE);
     lua_setfield(L, -2, "__type");
-    /* Metamethods */
-    lua_setfield(L, -2, "__index");
 
     return 0;
 }
