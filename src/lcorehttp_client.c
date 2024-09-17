@@ -6,8 +6,8 @@
 #include <string.h>
 #include "core_http_client.h"
 #include "extended_core_http_client.h"
+#include "lerror.h"
 #include "lss_options.h"
-#include "lutil.h"
 #include "socket.h"
 #include "socket_mbedtls.h"
 #include "transport_mbedtls.h"

@@ -5,7 +5,7 @@
 #include "core_http_client.h"
 #include "extended_core_http_client.h"
 #include "lcorehttp_preresponse.h"
-#include "lutil.h"
+#include "lerror.h"
 
 lcorehttp_preresponse*
 l_corehttp_new_preresponse(lua_State* L) {

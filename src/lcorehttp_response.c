@@ -6,9 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "lcorehttp_time.h"
+#include "lerror.h"
 #include "llhttp.h"
 #include "lss_transport.h"
-#include "lutil.h"
 
 lcorehttp_response*
 l_corehttp_new_response(lua_State* L) {
