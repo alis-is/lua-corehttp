@@ -177,7 +177,7 @@ l_corehttp_client_endpoint(lua_State* L) {
 int
 initializeRequestHeaders(lua_State* L, lcorehttp_client* client, HTTPRequestHeaders_t* requestHeaders) {
     HTTPRequestInfo_t requestInfo = {0};
-    size_t bufferSize = DEFAULT_COREHTTP_BUFFER_SIZE;
+    size_t buffer_size = DEFAULT_COREHTTP_BUFFER_SIZE;
     // get path from second argument
     requestInfo.pPath = luaL_checklstring(L, 2, &requestInfo.pathLen);
     // get method from third argument
@@ -192,13 +192,13 @@ initializeRequestHeaders(lua_State* L, lcorehttp_client* client, HTTPRequestHead
         lua_pop(L, 1);
 
         // get buffer size
-        lua_getfield(L, 4, "bufferSize");
+        lua_getfield(L, 4, "buffer_size");
         if (lua_isinteger(L, -1)) {
-            bufferSize = lua_tointeger(L, -1);
-            if (bufferSize < MINIMUM_COREHTTP_BUFFER_SIZE) {
-                bufferSize = MINIMUM_COREHTTP_BUFFER_SIZE;
-            } else if (bufferSize > MAXIMUM_COREHTTP_BUFFER_SIZE) {
-                bufferSize = MAXIMUM_COREHTTP_BUFFER_SIZE;
+            buffer_size = lua_tointeger(L, -1);
+            if (buffer_size < MINIMUM_COREHTTP_BUFFER_SIZE) {
+                buffer_size = MINIMUM_COREHTTP_BUFFER_SIZE;
+            } else if (buffer_size > MAXIMUM_COREHTTP_BUFFER_SIZE) {
+                buffer_size = MAXIMUM_COREHTTP_BUFFER_SIZE;
             }
         }
         lua_pop(L, 1);
@@ -212,11 +212,11 @@ initializeRequestHeaders(lua_State* L, lcorehttp_client* client, HTTPRequestHead
     }
     requestInfo.pHost = client->hostname;
     requestInfo.hostLen = client->hostname_len;
-    requestHeaders->pBuffer = malloc(bufferSize);
+    requestHeaders->pBuffer = malloc(buffer_size);
     if (requestHeaders->pBuffer == NULL) {
         return push_error(L, "failed to allocate buffer");
     }
-    requestHeaders->bufferLen = bufferSize;
+    requestHeaders->bufferLen = buffer_size;
 
     // initialize request headers
     HTTPStatus_t httpStatus = HTTPClient_InitializeRequestHeaders(requestHeaders, &requestInfo);
