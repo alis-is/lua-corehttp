@@ -65,7 +65,7 @@ HTTPClient_Validate(const TransportInterface_t* pTransport, HTTPRequestHeaders_t
 
 HTTPStatus_t
 HTTPClient_Read(const TransportInterface_t* pTransport, HTTPResponse_t* pResponse, uint8_t* pBuffer,
-                size_t bufferCapacity, size_t* pBytesRead) {
+                size_t buffer_capacity, size_t* pBytesRead) {
     HTTPStatus_t returnStatus = HTTPSuccess;
     uint8_t shouldRecv = 1U, timeoutReached = 0U;
     size_t totalReceived = 0U;
@@ -78,7 +78,7 @@ HTTPClient_Read(const TransportInterface_t* pTransport, HTTPResponse_t* pRespons
     while (shouldRecv == 1U) {
         /* Receive the HTTP response data into the pResponse->pBuffer. */
         currentReceived =
-            pTransport->recv(pTransport->pNetworkContext, pBuffer + totalReceived, bufferCapacity - totalReceived);
+            pTransport->recv(pTransport->pNetworkContext, pBuffer + totalReceived, buffer_capacity - totalReceived);
         if (currentReceived < 0) {
             LogError(("Failed to receive HTTP data: Transport recv() "
                       "returned error: TransportStatus=%ld",
@@ -99,7 +99,7 @@ HTTPClient_Read(const TransportInterface_t* pTransport, HTTPResponse_t* pRespons
             }
         }
         shouldRecv =
-            ((returnStatus == HTTPSuccess) && (timeoutReached == 0U) && (totalReceived < bufferCapacity)) ? 1U : 0U;
+            ((returnStatus == HTTPSuccess) && (timeoutReached == 0U) && (totalReceived < buffer_capacity)) ? 1U : 0U;
     }
     *pBytesRead = totalReceived;
 
