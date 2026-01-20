@@ -273,7 +273,7 @@ l_corehttp_response_read_content(lua_State* L) {
         // Progress Callback
         if (hasProgressFunc) {
             lua_pushvalue(L, 3);
-            lua_pushinteger(L, (contentLength != (size_t)-1) ? contentLength : 0);
+            lua_pushinteger(L, (contentLength != (size_t)-1) ? (lua_Integer)contentLength : -1);
             lua_pushinteger(L, totalBytesRead);
             lua_call(L, 2, 0);
         }
@@ -489,7 +489,7 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
 
                 if (hasProgressFunc) {
                     lua_pushvalue(L, 3);
-                    lua_pushinteger(L, 0);
+                    lua_pushinteger(L, -1); // Unknown total for chunked
                     lua_pushinteger(L, totalBytesRead);
                     lua_call(L, 2, 0);
                 }
