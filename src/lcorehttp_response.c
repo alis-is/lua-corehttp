@@ -347,6 +347,7 @@ l_corehttp_response_read_content(lua_State* L) {
 
 // Chunked Read
 // read_chunked_content(write_cb?, progress_cb?, buffer_size?)
+
 int
 l_corehttp_response_read_chunked_content(lua_State* L) {
     lcorehttp_response* response = luaL_checkudata(L, 1, LCOREHTTP_RESPONSE_METATABLE);
@@ -357,8 +358,6 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
     size_t bufferCapacity = (cap >= MINIMUM_CHUNK_BUFFER_SIZE) ? (size_t)cap : MINIMUM_CHUNK_BUFFER_SIZE;
 
     int inflateMode = l_corehttp_get_encoding_mode(L, 1);
-
-    // Buffers
     uint8_t* buffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
     uint8_t* outBuffer = NULL;
 
@@ -381,101 +380,64 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
     int state = 0;
     size_t chunkBytesRemaining = 0;
     size_t totalBytesRead = 0;
-    size_t cacheLen = 0; // Bytes valid
-    size_t cacheOff = 0; // Read position
+    size_t cacheLen = 0;
+    size_t cacheOff = 0;
+    int zlibStreamEnded = 0;
     int done = 0;
 
     while (!done) {
-        // Buffer Management
-        if (cacheOff >= cacheLen) {
-            cacheOff = 0;
-            cacheLen = 0;
-        } else if (cacheLen == bufferCapacity && cacheOff > 0) {
-            // Compact
-            size_t remaining = cacheLen - cacheOff;
-            memmove(buffer, buffer + cacheOff, remaining);
-            cacheLen = remaining;
-            cacheOff = 0;
-        }
-
-        // Network Read
-        if (cacheLen < bufferCapacity) {
-            size_t readAmt = 0;
-            int ret =
-                l_corehttp_response_read_internal(response, buffer + cacheLen, bufferCapacity - cacheLen, &readAmt);
-
-            if (ret != 0) {
-                return luaL_error(L, "network error: %d", ret);
-            }
-
-            if (readAmt == 0) {
-                // EOF logic
-                if (state == 0 && chunkBytesRemaining == 0) {
-                    break; // Acceptable clean EOF
-                }
-                if (cacheLen - cacheOff == 0) {
-                    break; // Unexpected EOF
-                }
-            }
-            cacheLen += readAmt;
-        }
-
         size_t available = cacheLen - cacheOff;
-        if (available == 0) {
-            break; // EOF
-        }
-
         uint8_t* p = buffer + cacheOff;
+        int madeProgress = 0;
 
-        // Parsing
-        if (state == 0) { // Chunk Size
+        // ATTEMPT TO PARSE
+        if (state == 0) { // Chunk Header
             uint8_t* lf = memchr(p, '\n', available);
-            if (!lf) {
-                if (cacheLen == bufferCapacity) {
+            if (lf) {
+                size_t lineLen = lf - p + 1;
+
+                char lenStr[32];
+                size_t hexLen = 0;
+                for (size_t i = 0; i < lineLen; i++) {
+                    if (p[i] == ';' || p[i] == '\r' || p[i] == '\n') {
+                        break;
+                    }
+                    if (hexLen < 31) {
+                        lenStr[hexLen++] = p[i];
+                    }
+                }
+                lenStr[hexLen] = 0;
+
+                if (hexLen == 0) {
+                    return luaL_error(L, "invalid chunk header");
+                }
+
+                char* endPtr;
+                unsigned long sz = strtoul(lenStr, &endPtr, 16);
+                if (*endPtr != 0) {
+                    return push_error(L, "invalid chunk size syntax");
+                }
+
+                chunkBytesRemaining = sz;
+                cacheOff += lineLen;
+
+                if (sz == 0) {
+                    done = 1;
+                } else {
+                    state = 1;
+                }
+                madeProgress = 1;
+            } else {
+                if (available == bufferCapacity) {
                     return luaL_error(L, "chunk header too long");
                 }
-                continue; // Need more data
             }
 
-            size_t lineLen = lf - p + 1;
-            char lenStr[32];
-            size_t hexLen = 0;
-
-            // Extract Hex, stop at separator or CRLF
-            for (size_t i = 0; i < lineLen; i++) {
-                if (p[i] == ';' || p[i] == '\r' || p[i] == '\n') {
-                    break;
-                }
-                if (hexLen < 31) {
-                    lenStr[hexLen++] = p[i];
-                }
-            }
-            lenStr[hexLen] = 0;
-
-            if (hexLen == 0) {
-                return luaL_error(L, "invalid chunk header");
-            }
-
-            char* endPtr;
-            unsigned long sz = strtoul(lenStr, &endPtr, 16);
-            if (*endPtr != 0) {
-                return luaL_error(L, "invalid chunk size syntax");
-            }
-
-            chunkBytesRemaining = sz;
-            cacheOff += lineLen;
-
-            if (sz == 0) {
-                done = 1;
-            } else {
-                state = 1;
-            }
-
-        } else if (state == 1) { // Data
+        } else if (state == 1) { // Chunk Data
             size_t toProcess = (available < chunkBytesRemaining) ? available : chunkBytesRemaining;
 
             if (toProcess > 0) {
-                if (inflateMode) {
+                if (inflateMode && !zlibStreamEnded) {
                     strm->next_in = (Bytef*)p;
                     strm->avail_in = toProcess;
                     while (strm->avail_in > 0) {
@@ -487,6 +449,7 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
                             return luaL_error(L, "inflate error: %d", zRet);
                         }
 
+                        // Write output FIRST, before any break conditions
                         size_t have = bufferCapacity - strm->avail_out;
                         if (have > 0) {
                             if (hasWriteFunc) {
@@ -497,7 +460,16 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
                                 luaL_addlstring(&b, (const char*)outBuffer, have);
                             }
                         }
+
+                        // Now check break conditions
                         if (zRet == Z_STREAM_END) {
+                            zlibStreamEnded = 1;
+                            toProcess -= strm->avail_in;
+                            break;
+                        }
+
+                        if (have == 0 && zRet == Z_OK) {
+                            toProcess -= strm->avail_in;
                             break;
                         }
                     }
@@ -510,36 +482,87 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
                         luaL_addlstring(&b, (const char*)p, toProcess);
                     }
                 }
+
                 totalBytesRead += toProcess;
                 chunkBytesRemaining -= toProcess;
                 cacheOff += toProcess;
 
                 if (hasProgressFunc) {
                     lua_pushvalue(L, 3);
-                    lua_pushinteger(L, 0); // Unknown total
+                    lua_pushinteger(L, 0);
                     lua_pushinteger(L, totalBytesRead);
                     lua_call(L, 2, 0);
                 }
-            }
 
-            if (chunkBytesRemaining == 0) {
-                state = 2;
+                if (chunkBytesRemaining == 0) {
+                    state = 2;
+                }
+                madeProgress = 1;
             }
 
         } else if (state == 2) { // Trailing CRLF
-            if (available < 2) {
-                continue; // Need \r\n
+            if (available >= 2) {
+                if (p[0] != '\r' || p[1] != '\n') {
+                    return luaL_error(L, "expected CRLF after chunk");
+                }
+                cacheOff += 2;
+                state = 0;
+                madeProgress = 1;
             }
-            if (p[0] != '\r' || p[1] != '\n') {
-                return luaL_error(L, "expected CRLF after chunk data");
-            }
-            cacheOff += 2;
-            state = 0;
         }
-    }
 
-    if (!done && state != 0) {
-        return luaL_error(L, "unexpected EOF in chunked body");
+        if (madeProgress) {
+            continue;
+        }
+
+        if (done) {
+            break;
+        }
+
+        // --- NETWORK READ ---
+        // Compact buffer first
+        if (cacheOff > 0) {
+            size_t remaining = cacheLen - cacheOff;
+            if (remaining > 0) {
+                memmove(buffer, buffer + cacheOff, remaining);
+            }
+            cacheLen = remaining;
+            cacheOff = 0;
+        }
+
+        // Calculate how much we NEED to read (not the whole buffer!)
+        size_t bytesNeeded = 0;
+        if (state == 0) {
+            // Header: Minimum is "0\r\n" = 3 bytes
+            bytesNeeded = 3;
+        } else if (state == 1) {
+            // Data: We need the remaining chunk bytes + 2 for CRLF + 5 for next header ("0\r\n" = 3, typical = 5)
+            bytesNeeded = chunkBytesRemaining + 5;
+        } else if (state == 2) {
+            // CRLF: We need exactly 2 bytes
+            bytesNeeded = 2;
+        }
+
+        // Don't read more than we have space for
+        size_t spaceAvailable = bufferCapacity - cacheLen;
+        size_t toRead = (bytesNeeded < spaceAvailable) ? bytesNeeded : spaceAvailable;
+
+        // Ensure we read at least 1 byte
+        if (toRead == 0) {
+            toRead = 1;
+        }
+
+        size_t readAmt = 0;
+        int ret = l_corehttp_response_read_internal(response, buffer + cacheLen, toRead, &readAmt);
+        if (ret != 0) {
+            return luaL_error(L, "network error: %d", ret);
+        }
+
+        if (readAmt == 0) {
+            return luaL_error(L, "unexpected EOF");
+        }
+
+        cacheLen += readAmt;
     }
 
     if (!hasWriteFunc) {
