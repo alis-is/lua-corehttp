@@ -12,7 +12,7 @@ typedef struct lcorehttp_response {
     const char* strStatus;
     const TransportInterface_t* transport;
     size_t contentLength;
-    uint8_t cachedBodyRead;
+    size_t cachedBodyRead;
     int isChunked;
 } lcorehttp_response;
 
