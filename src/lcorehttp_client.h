@@ -14,6 +14,7 @@
 #define MAXIMUM_COREHTTP_BUFFER_SIZE 1048576 /* 1MB */
 
 #define TRANSFER_ENCODING_HEADER     "transfer-encoding"
+#define CONTENT_LENGTH_HEADER        "content-length"
 
 typedef lss_connection NetworkContext;
 
@@ -35,4 +36,4 @@ typedef struct lcorehttp_client {
 int l_corehttp_newclient(lua_State* L);
 
 int l_corehttp_client_create_meta(lua_State* L);
-#endif /* LSS_TRANSPORT_MBEDTLS_H */
+#endif /* LCOREHTTP_CLIENT_H */

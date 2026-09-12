@@ -1,7 +1,6 @@
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
-#include <string.h>
 #include "core_http_client.h"
 #include "extended_core_http_client.h"
 #include "lcorehttp_preresponse.h"
@@ -10,9 +9,6 @@
 lcorehttp_preresponse*
 l_corehttp_new_preresponse(lua_State* L) {
     lcorehttp_preresponse* preresponse = lua_newuserdatauv(L, sizeof(lcorehttp_preresponse), 0);
-    if (preresponse == NULL) {
-        return NULL;
-    }
     luaL_getmetatable(L, LCOREHTTP_PRERESPONSE_METATABLE);
     lua_setmetatable(L, -2);
 

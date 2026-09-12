@@ -1,15 +1,16 @@
-#include <assert.h>
 #include <stdlib.h>
 #include "core_http_client.h"
 #include "core_http_client_private.h"
 #include "extended_core_http_client.h"
-#include "lcorehttp_client.h"
 
 static uint32_t
 getZeroTimestampMs(void) {
     return 0U;
 }
 
+// Fork of coreHTTP's private validateParams(). It is exposed separately so the
+// binding can validate, send headers, stream the body and read the response in
+// steps instead of using the all-in-one HTTPClient_Send().
 HTTPStatus_t
 HTTPClient_Validate(const TransportInterface_t* pTransport, HTTPRequestHeaders_t* pRequestHeaders,
                     const uint8_t* pRequestBodyBuf, size_t reqBodyBufLen, HTTPResponse_t* pResponse) {

@@ -1,7 +1,10 @@
+#ifndef LCOREHTTP_H
+#define LCOREHTTP_H
+
 #ifdef _WIN32
-#define LUA_SIMPLE_SOCKET_EXPORT __declspec(dllexport)
+#define LCOREHTTP_EXPORT __declspec(dllexport)
 #else
-#define LUA_SIMPLE_SOCKET_EXPORT
+#define LCOREHTTP_EXPORT
 #endif
 
 #ifdef __cplusplus
@@ -9,8 +12,10 @@ extern "C" {
 #endif
 #include <lua.h>
 
-LUA_SIMPLE_SOCKET_EXPORT int luaopen_lua_corehttp(lua_State* L);
+LCOREHTTP_EXPORT int luaopen_lua_corehttp(lua_State* L);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* LCOREHTTP_H */

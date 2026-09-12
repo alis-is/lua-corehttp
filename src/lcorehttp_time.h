@@ -14,7 +14,7 @@
  *
  * @return The current time in milliseconds.
  */
-uint32_t
+static inline uint32_t
 l_corehttp_get_time_ms(void) {
 #ifdef _WIN32
     FILETIME ft;

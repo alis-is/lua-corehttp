@@ -4,7 +4,6 @@
 
 #include "core_http_client.h"
 #include "extended_core_http_client.h"
-#include "lcorehttp_client.h"
 #include "lua.h"
 
 typedef struct lcorehttp_preresponse {

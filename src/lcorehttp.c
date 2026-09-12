@@ -9,12 +9,6 @@
 #include "lss.h"
 
 static const struct luaL_Reg lua_corehttp[] = {
-    /*
-    ---#DES 'is_tty.is_stdin_tty'
-    ---
-    ---Returns true if stdin is tty
-    ---@return boolean
-    */
     {"new_client", l_corehttp_newclient},
     {NULL, NULL}};
 

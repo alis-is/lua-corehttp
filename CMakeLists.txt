@@ -1,7 +1,6 @@
-project (lcorehttp) 
+cmake_minimum_required(VERSION 3.13)
+project(lcorehttp C)
 
-file(GLOB lcorehttp_sources ./src/**.c)
-set(lcorehttp ${lcorehttp_sources})
+file(GLOB lcorehttp_sources src/*.c)
 
-add_library(lcorehttp  ${lcorehttp})
-target_link_libraries(lcorehttp)
+add_library(lcorehttp ${lcorehttp_sources})
