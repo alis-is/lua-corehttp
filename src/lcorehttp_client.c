@@ -22,6 +22,11 @@ push_error_status(lua_State* L, int httpStatus) {
     return 3;
 }
 
+static const char*
+connection_kind_protocol(lss_connection_kind kind) {
+    return kind == LSS_CONNECTION_KIND_TLS ? "https" : "http";
+}
+
 static lcorehttp_client_connection_options
 load_corehttp_client_connection_options(lua_State* L, lss_connection_kind kind, int idx) {
     lcorehttp_client_connection_options options = {0};
@@ -58,26 +63,21 @@ l_corehttp_newclient(lua_State* L) {
     luaL_getmetatable(L, LCOREHTTP_CLIENT_METATABLE);
     lua_setmetatable(L, -2);
 
+    // new_client(host [, options]) or new_client(protocol, host [, port] [, options])
     const char* protocol = "https";
-    if (nargs == 1) {
-        client->hostname = strdup(luaL_checklstring(L, 1, &client->hostname_len));
-    } else if (nargs == 2) {
+    int hostIdx = 1;
+    if (nargs > 1) {
+        hostIdx = 2;
         if (lua_type(L, 1) == LUA_TSTRING) {
             protocol = lua_tostring(L, 1);
-        }
-        client->hostname = strdup(luaL_checklstring(L, 2, &client->hostname_len));
-    } else {
-        if (lua_type(L, 1) == LUA_TSTRING) {
-            protocol = lua_tostring(L, 1);
-        }
-        client->hostname = strdup(luaL_checklstring(L, 2, &client->hostname_len));
-        if (lua_type(L, 3) == LUA_TNUMBER) { // port number (optional)
-            client->portno = lua_tointeger(L, 3);
         }
     }
-
+    client->hostname = strdup(luaL_checklstring(L, hostIdx, &client->hostname_len));
     if (client->hostname == NULL) {
         return luaL_error(L, "failed to allocate hostname");
+    }
+    if (nargs == 3 && lua_type(L, 3) == LUA_TNUMBER) { // port number (optional)
+        client->portno = lua_tointeger(L, 3);
     }
 
     if (strcmp(protocol, "http") == 0) {
@@ -158,29 +158,20 @@ l_corehttp_client_gc(lua_State* L) {
 int
 l_corehttp_client_tostring(lua_State* L) {
     lcorehttp_client* client = (lcorehttp_client*)luaL_checkudata(L, 1, LCOREHTTP_CLIENT_METATABLE);
-    const char* protocol = NULL;
-    switch (client->kind) {
-        case LSS_CONNECTION_KIND_PLAINTEXT: protocol = "http"; break;
-        case LSS_CONNECTION_KIND_TLS: protocol = "https"; break;
-    }
-    lua_pushfstring(L, "lcorehttp_client (%s://%s:%d)", protocol, client->hostname, client->portno);
+    lua_pushfstring(L, "lcorehttp_client (%s://%s:%d)", connection_kind_protocol(client->kind), client->hostname,
+                    client->portno);
     return 1;
 }
 
 int
 l_corehttp_client_endpoint(lua_State* L) {
     lcorehttp_client* client = (lcorehttp_client*)luaL_checkudata(L, 1, LCOREHTTP_CLIENT_METATABLE);
-    const char* protocol = NULL;
-    switch (client->kind) {
-        case LSS_CONNECTION_KIND_PLAINTEXT: protocol = "http"; break;
-        case LSS_CONNECTION_KIND_TLS: protocol = "https"; break;
-    }
-    lua_pushfstring(L, "%s://%s:%d", protocol, client->hostname, client->portno);
+    lua_pushfstring(L, "%s://%s:%d", connection_kind_protocol(client->kind), client->hostname, client->portno);
     return 1;
 }
 
 static size_t
-loadRequestBufferSize(lua_State* L, int optionsIdx) {
+load_request_buffer_size(lua_State* L, int optionsIdx) {
     size_t bufferSize = DEFAULT_COREHTTP_BUFFER_SIZE;
     lua_getfield(L, optionsIdx, "buffer_size");
     if (lua_isinteger(L, -1)) {
@@ -196,7 +187,7 @@ loadRequestBufferSize(lua_State* L, int optionsIdx) {
 }
 
 static int
-addRequestHeaders(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int optionsIdx) {
+add_request_headers(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int optionsIdx) {
     lua_getfield(L, optionsIdx, "headers");
     if (lua_istable(L, -1)) {
         // iterate over headers
@@ -204,15 +195,19 @@ addRequestHeaders(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int option
         while (lua_next(L, -2) != 0) {
             // key is at -2, value is at -1
             size_t headerLen = 0;
-            const char* header = lua_tolstring(L, -2, &headerLen);
+            /* convert a copy: lua_tolstring on the key would invalidate it for lua_next */
+            lua_pushvalue(L, -2);
+            const char* header = lua_tolstring(L, -1, &headerLen);
             size_t valueLen = 0;
-            const char* value = lua_tolstring(L, -1, &valueLen);
+            const char* value = lua_tolstring(L, -2, &valueLen);
             if (headerLen > 0) {
                 HTTPStatus_t status = HTTPClient_AddHeader(requestHeaders, header, headerLen, value, valueLen);
                 if (status != HTTPSuccess) {
+                    lua_pop(L, 1); // key copy
                     return push_error_status(L, status);
                 }
             }
+            lua_pop(L, 1); // key copy
             lua_pop(L, 1); // remove value, keep key for next iteration
         }
     }
@@ -221,7 +216,7 @@ addRequestHeaders(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int option
 }
 
 static int
-addRequestRange(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int optionsIdx) {
+add_request_range(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int optionsIdx) {
     int rangeStart = -1;
     int hasRangeStart = 0;
     lua_getfield(L, optionsIdx, "rangeStart");
@@ -253,8 +248,32 @@ addRequestRange(lua_State* L, HTTPRequestHeaders_t* requestHeaders, int optionsI
     return 0;
 }
 
+static void
+load_request_options(lua_State* L, HTTPRequestInfo_t* requestInfo, size_t* bufferSize) {
+    *bufferSize = DEFAULT_COREHTTP_BUFFER_SIZE;
+    if (!lua_istable(L, 4)) {
+        return;
+    }
+
+    // get request flags
+    lua_getfield(L, 4, "requestFlags");
+    if (lua_isinteger(L, -1)) {
+        requestInfo->reqFlags = (uint32_t)lua_tointeger(L, -1);
+    }
+    lua_pop(L, 1);
+
+    *bufferSize = load_request_buffer_size(L, 4);
+
+    // keep alive
+    lua_getfield(L, 4, "keepAlive");
+    if (!lua_isboolean(L, -1) || lua_toboolean(L, -1)) { // default is true
+        requestInfo->reqFlags |= HTTP_REQUEST_KEEP_ALIVE_FLAG;
+    }
+    lua_pop(L, 1);
+}
+
 static int
-initializeRequestHeaders(lua_State* L, lcorehttp_client* client, HTTPRequestHeaders_t* requestHeaders, int* isHead) {
+initialize_request_headers(lua_State* L, lcorehttp_client* client, HTTPRequestHeaders_t* requestHeaders, int* isHead) {
     HTTPRequestInfo_t requestInfo = {0};
     // get path from second argument
     requestInfo.pPath = luaL_checklstring(L, 2, &requestInfo.pathLen);
@@ -262,26 +281,10 @@ initializeRequestHeaders(lua_State* L, lcorehttp_client* client, HTTPRequestHead
     requestInfo.pMethod = luaL_checklstring(L, 3, &requestInfo.methodLen);
     *isHead = requestInfo.methodLen == sizeof(HTTP_METHOD_HEAD) - 1
         && strncmp(requestInfo.pMethod, HTTP_METHOD_HEAD, requestInfo.methodLen) == 0;
-    requestInfo.reqFlags = 0;
 
-    size_t bufferSize = DEFAULT_COREHTTP_BUFFER_SIZE;
-    if (lua_istable(L, 4)) {
-        // get request flags
-        lua_getfield(L, 4, "requestFlags");
-        if (lua_isinteger(L, -1)) {
-            requestInfo.reqFlags = (uint32_t)lua_tointeger(L, -1);
-        }
-        lua_pop(L, 1);
+    size_t bufferSize = 0;
+    load_request_options(L, &requestInfo, &bufferSize);
 
-        bufferSize = loadRequestBufferSize(L, 4);
-
-        // keep alive
-        lua_getfield(L, 4, "keepAlive");
-        if (!lua_isboolean(L, -1) || lua_toboolean(L, -1)) { // default is true
-            requestInfo.reqFlags |= HTTP_REQUEST_KEEP_ALIVE_FLAG;
-        }
-        lua_pop(L, 1);
-    }
     requestInfo.pHost = client->hostname;
     requestInfo.hostLen = client->hostname_len;
 
@@ -298,11 +301,11 @@ initializeRequestHeaders(lua_State* L, lcorehttp_client* client, HTTPRequestHead
     }
 
     if (lua_istable(L, 4)) {
-        int result = addRequestHeaders(L, requestHeaders, 4);
+        int result = add_request_headers(L, requestHeaders, 4);
         if (result != 0) {
             return result;
         }
-        result = addRequestRange(L, requestHeaders, 4);
+        result = add_request_range(L, requestHeaders, 4);
         if (result != 0) {
             return result;
         }
@@ -316,7 +319,7 @@ typedef struct lcorehttp_headers_callback_context {
 } lcorehttp_headers_callback_context;
 
 static void
-preloadHeader(void* pContext, const char* fieldLoc, size_t fieldLen, const char* valueLoc, size_t valueLen,
+preload_header(void* pContext, const char* fieldLoc, size_t fieldLen, const char* valueLoc, size_t valueLen,
               uint16_t statusCode) {
     lcorehttp_headers_callback_context* context = (lcorehttp_headers_callback_context*)pContext;
 
@@ -326,8 +329,9 @@ preloadHeader(void* pContext, const char* fieldLoc, size_t fieldLen, const char*
     lua_settable(context->L, context->headersTableIdx); // Set key-value pair in table
 }
 
+// Head responses and 1xx/204/304 carry no body by definition.
 static void
-initializeResponseBodyLength(HTTPResponse_t* httpResponse, lcorehttp_response* response, int isHead) {
+initialize_response_body_length(HTTPResponse_t* httpResponse, lcorehttp_response* response, int isHead) {
     uint16_t statusCode = httpResponse->statusCode;
     if (isHead || statusCode == 204 || statusCode == 304 || (statusCode >= 100 && statusCode < 200)) {
         response->contentLength = 0;
@@ -340,7 +344,20 @@ initializeResponseBodyLength(HTTPResponse_t* httpResponse, lcorehttp_response* r
         == HTTPSuccess) {
         response->contentLength = httpResponse->contentLength;
     } else {
-        response->contentLength = (size_t)-1; // close-delimited body, read until EOF
+        response->contentLength = LCOREHTTP_CONTENT_LENGTH_UNKNOWN; // close-delimited body, read until EOF
+    }
+}
+
+static void
+initialize_chunked_transfer(HTTPResponse_t* httpResponse, lcorehttp_response* response) {
+    const char* value = NULL;
+    size_t valueLen = 0;
+    if (HTTPClient_ReadHeader(httpResponse, TRANSFER_ENCODING_HEADER, strlen(TRANSFER_ENCODING_HEADER), &value,
+                              &valueLen)
+            == HTTPSuccess
+        && valueLen == sizeof("chunked") - 1 && strncasecmp(value, "chunked", valueLen) == 0) {
+        response->contentLength = LCOREHTTP_CONTENT_LENGTH_UNKNOWN;
+        response->isChunked = 1;
     }
 }
 
@@ -351,7 +368,7 @@ typedef struct lcorehttp_request_body {
 } lcorehttp_request_body;
 
 static void
-loadRequestBody(lua_State* L, int optionsIdx, lcorehttp_request_body* body, uint32_t* sendFlags) {
+load_request_body(lua_State* L, int optionsIdx, lcorehttp_request_body* body, uint32_t* sendFlags) {
     body->data = NULL;
     body->len = 0;
     body->hasWriteHook = 0;
@@ -375,7 +392,29 @@ loadRequestBody(lua_State* L, int optionsIdx, lcorehttp_request_body* body, uint
 }
 
 static int
-sendRequestBody(lua_State* L, const lcorehttp_request_body* body, lcorehttp_response* response,
+call_write_body_hook(lua_State* L, lcorehttp_response* response, int optionsIdx) {
+    lua_getfield(L, optionsIdx, "write_body_hook");
+    lcorehttp_preresponse* preresponse = l_corehttp_new_preresponse(L);
+    preresponse->transport = response->transport;
+    preresponse->response = &response->response;
+    lua_pushvalue(L, -2); /* function */
+    lua_pushvalue(L, -2); /* argument the hook may discard */
+    int hookStatus = lua_pcall(L, 1, 0, 0);
+    /* The hook may retain the preresponse past this request; it must never
+     * outlive the response/transport it borrows. The userdata stays rooted on
+     * the stack below the call, so a hook that drops its argument and collects
+     * cannot free it before this cleanup writes. */
+    preresponse->transport = NULL;
+    preresponse->response = NULL;
+    if (hookStatus != LUA_OK) {
+        return push_error(L, lua_tostring(L, -1));
+    }
+    lua_pop(L, 2); // preresponse, write_body_hook
+    return 0;
+}
+
+static int
+send_request_body(lua_State* L, const lcorehttp_request_body* body, lcorehttp_response* response,
                 HTTPRequestHeaders_t* requestHeaders, int optionsIdx, uint32_t sendFlags) {
     HTTPStatus_t status = HTTPClient_SendHttpHeaders(response->transport, response->response.getTime, requestHeaders,
                                                      body->len, sendFlags);
@@ -392,15 +431,36 @@ sendRequestBody(lua_State* L, const lcorehttp_request_body* body, lcorehttp_resp
         return 0;
     }
 
-    lua_getfield(L, optionsIdx, "write_body_hook");
-    lua_pushvalue(L, -1);
-    lcorehttp_preresponse* preresponse = l_corehttp_new_preresponse(L);
-    preresponse->transport = response->transport;
-    preresponse->response = &response->response;
-    if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-        return push_error(L, lua_tostring(L, -1));
+    return call_write_body_hook(L, response, optionsIdx);
+}
+
+// Opens the connection described by client/options and fills in the transport interface.
+// On failure the caller must free requestHeaders.pBuffer; nothing is allocated on success
+// beyond what response->__gc owns.
+static int
+create_request_transport(lua_State* L, lcorehttp_client* client, TransportInterface_t** transportInterface) {
+    lcorehttp_client_connection_options options = load_corehttp_client_connection_options(L, client->kind, 4);
+    if (lua_istable(L, 4) &&
+        ((client->kind == LSS_CONNECTION_KIND_PLAINTEXT && options.plaintext == NULL) ||
+         (client->kind == LSS_CONNECTION_KIND_TLS && options.tls == NULL))) {
+        return push_error(L, client->kind == LSS_CONNECTION_KIND_PLAINTEXT
+            ? "failed to allocate plaintext options"
+            : "failed to allocate tls options");
     }
-    lua_pop(L, 1); // write_body_hook
+
+    TransportInterface_t* transport = malloc(sizeof(TransportInterface_t));
+    int result = transport == NULL ? push_error(L, "failed to allocate transport")
+                                  : corehttp_client_create_transport(L, client, transport, options);
+    switch (client->kind) {
+        case LSS_CONNECTION_KIND_PLAINTEXT: lss_free_plain_connection_options(options.plaintext); break;
+        case LSS_CONNECTION_KIND_TLS: lss_free_tls_connection_options(options.tls); break;
+    }
+    if (result != 0) {
+        free(transport);
+        return result;
+    }
+
+    *transportInterface = transport;
     return 0;
 }
 
@@ -413,7 +473,7 @@ l_corehttp_client_request(lua_State* L) {
 
     int isHead = 0;
     HTTPRequestHeaders_t requestHeaders = {0};
-    int resultCount = initializeRequestHeaders(L, client, &requestHeaders, &isHead);
+    int resultCount = initialize_request_headers(L, client, &requestHeaders, &isHead);
     if (resultCount != 0) {
         free(requestHeaders.pBuffer);
         return resultCount;
@@ -421,20 +481,12 @@ l_corehttp_client_request(lua_State* L) {
 
     uint32_t sendFlags = 0;
     lcorehttp_request_body body = {0};
-    loadRequestBody(L, 4, &body, &sendFlags);
+    load_request_body(L, 4, &body, &sendFlags);
 
-    lcorehttp_client_connection_options options = load_corehttp_client_connection_options(L, client->kind, 4);
-    TransportInterface_t* transportInterface = malloc(sizeof(TransportInterface_t));
-    resultCount = transportInterface == NULL
-        ? push_error(L, "failed to allocate transport")
-        : corehttp_client_create_transport(L, client, transportInterface, options);
-    switch (client->kind) {
-        case LSS_CONNECTION_KIND_PLAINTEXT: lss_free_plain_connection_options(options.plaintext); break;
-        case LSS_CONNECTION_KIND_TLS: lss_free_tls_connection_options(options.tls); break;
-    }
+    TransportInterface_t* transportInterface = NULL;
+    resultCount = create_request_transport(L, client, &transportInterface);
     if (resultCount != 0) {
         free(requestHeaders.pBuffer);
-        free(transportInterface);
         return resultCount;
     }
 
@@ -448,8 +500,7 @@ l_corehttp_client_request(lua_State* L) {
     int headersTableIdx = lua_gettop(L);
     lcorehttp_headers_callback_context headersContext = {L, headersTableIdx};
     HTTPClient_ResponseHeaderParsingCallback_t headerParsingCallback = {.pContext = &headersContext,
-                                                                        .onHeaderCallback = preloadHeader};
-    response->response.pHeaderParsingCallback = &headerParsingCallback;
+                                                                        .onHeaderCallback = preload_header};
 
     response->status =
         HTTPClient_Validate(transportInterface, &requestHeaders, body.data, body.len, &response->response);
@@ -457,30 +508,22 @@ l_corehttp_client_request(lua_State* L) {
         return push_error_status(L, response->status);
     }
 
-    resultCount = sendRequestBody(L, &body, response, &requestHeaders, 4, sendFlags);
+    resultCount = send_request_body(L, &body, response, &requestHeaders, 4, sendFlags);
     if (resultCount != 0) {
         return resultCount;
     }
 
+    response->response.pHeaderParsingCallback = &headerParsingCallback;
     response->status = HTTPClient_ReceiveAndParseHttpResponse(transportInterface, &response->response, &requestHeaders);
+    response->response.pHeaderParsingCallback = NULL;
     if ((response->status == HTTPInsufficientMemory || response->status == HTTPPartialResponse)
         && response->response.areHeadersComplete) { // headers are complete, we can read the body later
         response->status = HTTPSuccess;
     }
     response->strStatus = HTTPClient_strerror(response->status);
 
-    initializeResponseBodyLength(&response->response, response, isHead);
-
-    const char* transferEncodingHeaderValue = NULL;
-    size_t transferEncodingHeaderValueLen = 0;
-    HTTPStatus_t headerStatus =
-        HTTPClient_ReadHeader(&response->response, TRANSFER_ENCODING_HEADER, strlen(TRANSFER_ENCODING_HEADER),
-                              &transferEncodingHeaderValue, &transferEncodingHeaderValueLen);
-    if (headerStatus == HTTPSuccess && transferEncodingHeaderValueLen == sizeof("chunked") - 1
-        && strncasecmp(transferEncodingHeaderValue, "chunked", sizeof("chunked") - 1) == 0) {
-        response->contentLength = (size_t)-1;
-        response->isChunked = 1;
-    }
+    initialize_response_body_length(&response->response, response, isHead);
+    initialize_chunked_transfer(&response->response, response);
 
     luaL_getmetatable(L, LCOREHTTP_HEADERS_METATABLE);
     lua_setmetatable(L, headersTableIdx);
@@ -489,25 +532,27 @@ l_corehttp_client_request(lua_State* L) {
     return 1;
 }
 
+static const luaL_Reg lcorehttp_client_methods[] = {
+    {"request", l_corehttp_client_request},
+    {"endpoint", l_corehttp_client_endpoint},
+    {NULL, NULL}};
+
+static const luaL_Reg lcorehttp_client_metamethods[] = {
+    {"__tostring", l_corehttp_client_tostring},
+    {"__gc", l_corehttp_client_gc},
+    {"__close", l_corehttp_client_gc},
+    {NULL, NULL}};
+
 int
 l_corehttp_client_create_meta(lua_State* L) {
     luaL_newmetatable(L, LCOREHTTP_CLIENT_METATABLE);
-    /* Metamethods */
+    luaL_setfuncs(L, lcorehttp_client_metamethods, 0);
+
     lua_newtable(L);
-    lua_pushcfunction(L, l_corehttp_client_tostring);
-    lua_setfield(L, -2, "__tostring");
-    lua_pushcfunction(L, l_corehttp_client_request);
-    lua_setfield(L, -2, "request");
-    lua_pushcfunction(L, l_corehttp_client_endpoint);
-    lua_setfield(L, -2, "endpoint");
+    luaL_setfuncs(L, lcorehttp_client_methods, 0);
     lua_pushstring(L, LCOREHTTP_CLIENT_METATABLE);
     lua_setfield(L, -2, "__type");
-    /* Metamethods */
     lua_setfield(L, -2, "__index");
 
-    lua_pushcfunction(L, l_corehttp_client_gc);
-    lua_setfield(L, -2, "__gc");
-    lua_pushcfunction(L, l_corehttp_client_gc);
-    lua_setfield(L, -2, "__close");
     return 1;
 }

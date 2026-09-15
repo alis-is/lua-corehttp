@@ -40,19 +40,23 @@ l_corehttp_preresponse_gc(lua_State* L) {
     return 0;
 }
 
+static const luaL_Reg lcorehttp_preresponse_methods[] = {
+    {"write", l_corehttp_preresponse_write},
+    {NULL, NULL}};
+
+static const luaL_Reg lcorehttp_preresponse_metamethods[] = {
+    {"__gc", l_corehttp_preresponse_gc},
+    {"__close", l_corehttp_preresponse_gc},
+    {NULL, NULL}};
+
 int
 l_corehttp_preresponse_create_meta(lua_State* L) {
     luaL_newmetatable(L, LCOREHTTP_PRERESPONSE_METATABLE);
+    luaL_setfuncs(L, lcorehttp_preresponse_metamethods, 0);
 
     lua_newtable(L);
-    lua_pushcfunction(L, l_corehttp_preresponse_write);
-    lua_setfield(L, -2, "write");
+    luaL_setfuncs(L, lcorehttp_preresponse_methods, 0);
     lua_setfield(L, -2, "__index");
-
-    lua_pushcfunction(L, l_corehttp_preresponse_gc);
-    lua_setfield(L, -2, "__gc");
-    lua_pushcfunction(L, l_corehttp_preresponse_gc);
-    lua_setfield(L, -2, "__close");
 
     return 0;
 }

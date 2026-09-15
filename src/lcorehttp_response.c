@@ -20,7 +20,7 @@ l_corehttp_new_response(lua_State* L) {
     lua_setmetatable(L, -2);
     memset(response, 0, sizeof(lcorehttp_response));
     response->response.getTime = l_corehttp_get_time_ms;
-    response->contentLength = -1;
+    response->contentLength = LCOREHTTP_CONTENT_LENGTH_UNKNOWN;
     response->cachedBodyRead = 0;
     return response;
 }
@@ -151,17 +151,23 @@ l_corehttp_get_encoding_mode(lua_State* L, int respIdx) {
     return mode;
 }
 
+typedef enum lcorehttp_read_status {
+    LCOREHTTP_READ_OK = 0,
+    LCOREHTTP_READ_ERROR = -1,   // transport or parse failure
+    LCOREHTTP_READ_TIMEOUT = -2, // no data before HTTP_RECV_RETRY_TIMEOUT_MS
+} lcorehttp_read_status;
+
 // --- Internal Reader ---
 // Handles reading from internal cache and network transport.
-// Returns 0 on success (0 bytes means EOF), -1 on transport error, -2 on read timeout.
-static int
+// Returns LCOREHTTP_READ_OK on success (0 bytes means EOF).
+static lcorehttp_read_status
 l_corehttp_response_read_internal(lcorehttp_response* response, uint8_t* buffer, size_t bufferLen,
                                   size_t* outBytesRead) {
     *outBytesRead = 0;
 
     // No Content
     if (response->contentLength == 0 && !response->isChunked) {
-        return 0;
+        return LCOREHTTP_READ_OK;
     }
 
     // Read from Cache (pre-fetched body during header parsing)
@@ -174,26 +180,29 @@ l_corehttp_response_read_internal(lcorehttp_response* response, uint8_t* buffer,
 
         response->cachedBodyRead += toCopy;
         *outBytesRead = toCopy;
-        return 0;
+        return LCOREHTTP_READ_OK;
     }
 
-    // Close-delimited body: the transport reports both EOF and errors as a
-    // negative value, so read until it stops producing data.
-    if (response->contentLength == (size_t)-1 && !response->isChunked) {
+    // Close-delimited body: read until the transport reports EOF; a transport
+    // or TLS failure is a truncated download, not an end of body.
+    if (response->contentLength == LCOREHTTP_CONTENT_LENGTH_UNKNOWN && !response->isChunked) {
         uint32_t startTimeMs = l_corehttp_get_time_ms();
         while (1) {
             int32_t received = response->transport->recv(response->transport->pNetworkContext, buffer, bufferLen);
             if (received > 0) {
                 *outBytesRead = (size_t)received;
-                return 0;
+                return LCOREHTTP_READ_OK;
+            }
+            if (received == LSS_TRANSPORT_EOF) {
+                return LCOREHTTP_READ_OK; // clean end of a close-delimited body
             }
             if (received < 0) {
-                return 0; // EOF or transport error ends a close-delimited body
+                return LCOREHTTP_READ_ERROR; // transport error: surface truncated data
             }
             // Zero means the configured read timeout elapsed without data. Keep
             // waiting briefly instead of reporting EOF, then surface a timeout.
             if ((uint32_t)(l_corehttp_get_time_ms() - startTimeMs) >= HTTP_RECV_RETRY_TIMEOUT_MS) {
-                return -2;
+                return LCOREHTTP_READ_TIMEOUT;
             }
         }
     }
@@ -201,9 +210,9 @@ l_corehttp_response_read_internal(lcorehttp_response* response, uint8_t* buffer,
     // Read from Network
     HTTPStatus_t status = HTTPClient_Read(response->transport, &response->response, buffer, bufferLen, outBytesRead);
     if (status != HTTPSuccess) {
-        return -1;
+        return LCOREHTTP_READ_ERROR;
     }
-    return 0;
+    return LCOREHTTP_READ_OK;
 }
 
 typedef struct lcorehttp_reader_sink {
@@ -216,7 +225,7 @@ typedef struct lcorehttp_reader_sink {
 } lcorehttp_reader_sink;
 
 static void
-sinkInit(lua_State* L, lcorehttp_reader_sink* sink, int writeFuncIdx, int progressFuncIdx) {
+sink_init(lua_State* L, lcorehttp_reader_sink* sink, int writeFuncIdx, int progressFuncIdx) {
     sink->L = L;
     sink->writeFuncIdx = writeFuncIdx;
     sink->progressFuncIdx = progressFuncIdx;
@@ -229,7 +238,7 @@ sinkInit(lua_State* L, lcorehttp_reader_sink* sink, int writeFuncIdx, int progre
 
 // Callbacks are balanced on the stack, which keeps the active luaL_Buffer valid across them.
 static void
-sinkEmit(lcorehttp_reader_sink* sink, const char* data, size_t len) {
+sink_emit(lcorehttp_reader_sink* sink, const char* data, size_t len) {
     if (len == 0) {
         return;
     }
@@ -243,19 +252,19 @@ sinkEmit(lcorehttp_reader_sink* sink, const char* data, size_t len) {
 }
 
 static void
-sinkProgress(lcorehttp_reader_sink* sink, size_t total) {
+sink_progress(lcorehttp_reader_sink* sink, size_t total) {
     if (sink->progressFuncIdx == 0) {
         return;
     }
     lua_pushvalue(sink->L, sink->progressFuncIdx);
-    lua_pushinteger(sink->L, total == (size_t)-1 ? -1 : (lua_Integer)total);
+    lua_pushinteger(sink->L, total == LCOREHTTP_CONTENT_LENGTH_UNKNOWN ? -1 : (lua_Integer)total);
     lua_pushinteger(sink->L, (lua_Integer)sink->totalBytesRead);
     lua_call(sink->L, 2, 0);
 }
 
 // Inflates input into the sink. Returns -1 on error, 1 when the zlib stream ended, 0 otherwise.
 static int
-inflateToSink(lcorehttp_reader_sink* sink, z_stream* strm, const uint8_t* input, size_t inputLen, uint8_t* output,
+inflate_to_sink(lcorehttp_reader_sink* sink, z_stream* strm, const uint8_t* input, size_t inputLen, uint8_t* output,
               size_t outputCapacity, size_t* consumed) {
     strm->next_in = (Bytef*)input;
     strm->avail_in = inputLen;
@@ -270,7 +279,7 @@ inflateToSink(lcorehttp_reader_sink* sink, z_stream* strm, const uint8_t* input,
         }
 
         size_t produced = outputCapacity - strm->avail_out;
-        sinkEmit(sink, (const char*)output, produced);
+        sink_emit(sink, (const char*)output, produced);
 
         if (zRet == Z_STREAM_END) {
             *consumed = inputLen - strm->avail_in;
@@ -284,6 +293,48 @@ inflateToSink(lcorehttp_reader_sink* sink, z_stream* strm, const uint8_t* input,
 
     *consumed = inputLen - strm->avail_in;
     return 0;
+}
+
+// Buffers, optional inflate stream and callbacks shared by read_content and
+// read_chunked_content. Buffers are userdata so the GC owns them.
+typedef struct lcorehttp_reader {
+    size_t bufferCapacity;
+    uint8_t* buffer;
+    uint8_t* outBuffer;
+    z_stream* strm;
+    lcorehttp_reader_sink sink;
+} lcorehttp_reader;
+
+static int
+reader_init(lua_State* L, size_t bufferCapacity, lcorehttp_reader* reader) {
+    reader->bufferCapacity = bufferCapacity;
+
+    int inflateMode = l_corehttp_get_encoding_mode(L, 1);
+    reader->strm = NULL;
+    reader->outBuffer = NULL;
+    reader->buffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
+    if (inflateMode) {
+        int windowBits = (inflateMode == 1) ? 31 : 15;
+        reader->strm = create_auto_zstream(L, windowBits); // Pushes userdata on stack
+        if (reader->strm == NULL) {
+            return push_error(L, "failed to initialize zlib");
+        }
+        reader->outBuffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
+    }
+
+    sink_init(L, &reader->sink, lua_isfunction(L, 2) ? 2 : 0, lua_isfunction(L, 3) ? 3 : 0);
+    return 0;
+}
+
+// Pushes the collected body (or bytes written count when a write callback was used).
+static int
+reader_finish(lua_State* L, lcorehttp_reader* reader) {
+    if (reader->sink.useBuffer) {
+        luaL_pushresult(&reader->sink.buffer);
+    } else {
+        lua_pushinteger(L, (lua_Integer)reader->sink.totalBytesRead);
+    }
+    return 1;
 }
 
 // Raw Read
@@ -308,10 +359,10 @@ l_corehttp_response_read(lua_State* L) {
     size_t bytesRead = 0;
 
     int result = l_corehttp_response_read_internal(response, buffer, (size_t)reqLen, &bytesRead);
-    if (result == -2) {
+    if (result == LCOREHTTP_READ_TIMEOUT) {
         return push_error(L, "read timeout");
     }
-    if (result != 0) {
+    if (result != LCOREHTTP_READ_OK) {
         return push_error(L, "failed to read response body");
     }
 
@@ -330,36 +381,21 @@ l_corehttp_response_read_content(lua_State* L) {
         return push_error(L, "response is closed");
     }
 
-    int hasWriteFunc = lua_isfunction(L, 2);
-    int hasProgressFunc = lua_isfunction(L, 3);
-
     lua_Integer cap = luaL_optinteger(L, 4, DEFAULT_COREHTTP_BUFFER_SIZE);
     size_t bufferCapacity = (cap > 0) ? (size_t)cap : DEFAULT_COREHTTP_BUFFER_SIZE;
 
-    int inflateMode = l_corehttp_get_encoding_mode(L, 1);
-    size_t contentLength = response->contentLength;
-
-    // Buffer Allocation (GC managed)
-    uint8_t* buffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
-    uint8_t* outBuffer = NULL;
-    z_stream* strm = NULL;
-    if (inflateMode) {
-        int windowBits = (inflateMode == 1) ? 31 : 15;
-        strm = create_auto_zstream(L, windowBits); // Pushes userdata on stack
-        if (strm == NULL) {
-            return push_error(L, "failed to initialize zlib");
-        }
-        outBuffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
+    lcorehttp_reader reader;
+    int result = reader_init(L, bufferCapacity, &reader);
+    if (result != 0) {
+        return result;
     }
 
-    lcorehttp_reader_sink sink;
-    sinkInit(L, &sink, hasWriteFunc ? 2 : 0, hasProgressFunc ? 3 : 0);
-
+    size_t contentLength = response->contentLength;
     while (1) {
         // Calculate read size
         size_t toRead = bufferCapacity;
-        if (contentLength != (size_t)-1) {
-            size_t remaining = contentLength - sink.totalBytesRead;
+        if (contentLength != LCOREHTTP_CONTENT_LENGTH_UNKNOWN) {
+            size_t remaining = contentLength - reader.sink.totalBytesRead;
             if (remaining == 0) {
                 break;
             }
@@ -369,54 +405,56 @@ l_corehttp_response_read_content(lua_State* L) {
         }
 
         size_t bytesRead = 0;
-        int ret = l_corehttp_response_read_internal(response, buffer, toRead, &bytesRead);
-        if (ret == -2) {
+        int ret = l_corehttp_response_read_internal(response, reader.buffer, toRead, &bytesRead);
+        if (ret == LCOREHTTP_READ_TIMEOUT) {
             return push_error(L, "read timeout");
         }
-        if (ret != 0) {
+        if (ret != LCOREHTTP_READ_OK) {
             return push_error(L, "failed to read response body");
         }
         if (bytesRead == 0) {
             break; // EOF
         }
 
-        sink.totalBytesRead += bytesRead;
+        reader.sink.totalBytesRead += bytesRead;
 
         // Progress Callback
-        sinkProgress(&sink, contentLength);
+        sink_progress(&reader.sink, contentLength);
 
         // Process Data
-        if (inflateMode) {
+        if (reader.strm != NULL) {
             size_t consumed = 0;
-            if (inflateToSink(&sink, strm, buffer, bytesRead, outBuffer, bufferCapacity, &consumed) < 0) {
+            if (inflate_to_sink(&reader.sink, reader.strm, reader.buffer, bytesRead, reader.outBuffer, bufferCapacity,
+                              &consumed) < 0) {
                 return push_error(L, "inflate error");
             }
         } else {
-            sinkEmit(&sink, (const char*)buffer, bytesRead);
+            sink_emit(&reader.sink, (const char*)reader.buffer, bytesRead);
         }
 
-        if (contentLength != (size_t)-1 && sink.totalBytesRead >= contentLength) {
+        if (contentLength != LCOREHTTP_CONTENT_LENGTH_UNKNOWN && reader.sink.totalBytesRead >= contentLength) {
             break;
         }
     }
 
-    if (contentLength != (size_t)-1 && contentLength > 0 && sink.totalBytesRead < contentLength) {
+    if (contentLength != LCOREHTTP_CONTENT_LENGTH_UNKNOWN && contentLength > 0
+        && reader.sink.totalBytesRead < contentLength) {
         lua_pushfstring(L, "incomplete read: expected %I bytes, got %I", (lua_Integer)contentLength,
-                        (lua_Integer)sink.totalBytesRead);
+                        (lua_Integer)reader.sink.totalBytesRead);
         return push_error(L, lua_tostring(L, -1));
     }
 
-    if (hasWriteFunc) {
-        lua_pushinteger(L, sink.totalBytesRead);
-    } else {
-        luaL_pushresult(&sink.buffer);
-    }
-
-    return 1;
+    return reader_finish(L, &reader);
 }
 
 // Chunked Read
 // read_chunked_content(write_cb?, progress_cb?, buffer_size?)
+
+typedef enum lcorehttp_chunk_state {
+    LCOREHTTP_CHUNK_HEADER = 0,
+    LCOREHTTP_CHUNK_DATA = 1,
+    LCOREHTTP_CHUNK_TRAILER = 2,
+} lcorehttp_chunk_state;
 
 int
 l_corehttp_response_read_chunked_content(lua_State* L) {
@@ -424,30 +462,17 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
     if (response->transport == NULL) {
         return push_error(L, "response is closed");
     }
-    int hasWriteFunc = lua_isfunction(L, 2);
-    int hasProgressFunc = lua_isfunction(L, 3);
 
     lua_Integer cap = luaL_optinteger(L, 4, DEFAULT_COREHTTP_BUFFER_SIZE);
     size_t bufferCapacity = (cap >= MINIMUM_COREHTTP_BUFFER_SIZE) ? (size_t)cap : MINIMUM_COREHTTP_BUFFER_SIZE;
 
-    int inflateMode = l_corehttp_get_encoding_mode(L, 1);
-    uint8_t* buffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
-    uint8_t* outBuffer = NULL;
-    z_stream* strm = NULL;
-    if (inflateMode) {
-        int windowBits = (inflateMode == 1) ? 31 : 15;
-        strm = create_auto_zstream(L, windowBits);
-        if (strm == NULL) {
-            return push_error(L, "failed to initialize zlib");
-        }
-        outBuffer = (uint8_t*)lua_newuserdatauv(L, bufferCapacity, 0);
+    lcorehttp_reader reader;
+    int result = reader_init(L, bufferCapacity, &reader);
+    if (result != 0) {
+        return result;
     }
 
-    lcorehttp_reader_sink sink;
-    sinkInit(L, &sink, hasWriteFunc ? 2 : 0, hasProgressFunc ? 3 : 0);
-
-    // State Machine: 0=Header, 1=Data, 2=Trailing CRLF
-    int state = 0;
+    lcorehttp_chunk_state state = LCOREHTTP_CHUNK_HEADER;
     size_t chunkBytesRemaining = 0;
     size_t cacheLen = 0;
     size_t cacheOff = 0;
@@ -456,11 +481,11 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
 
     while (!done) {
         size_t available = cacheLen - cacheOff;
-        uint8_t* p = buffer + cacheOff;
+        uint8_t* p = reader.buffer + cacheOff;
         int madeProgress = 0;
 
         // ATTEMPT TO PARSE
-        if (state == 0) { // Chunk Header
+        if (state == LCOREHTTP_CHUNK_HEADER) {
             uint8_t* lf = memchr(p, '\n', available);
             if (lf) {
                 size_t lineLen = lf - p + 1;
@@ -494,7 +519,7 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
                 if (sz == 0) {
                     done = 1;
                 } else {
-                    state = 1;
+                    state = LCOREHTTP_CHUNK_DATA;
                 }
                 madeProgress = 1;
             } else {
@@ -503,13 +528,15 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
                 }
             }
 
-        } else if (state == 1) { // Chunk Data
+        } else if (state == LCOREHTTP_CHUNK_DATA) {
             size_t toProcess = (available < chunkBytesRemaining) ? available : chunkBytesRemaining;
 
             if (toProcess > 0) {
-                if (inflateMode && !zlibStreamEnded) {
+                if (reader.strm != NULL && !zlibStreamEnded) {
                     size_t consumed = 0;
-                    int zRet = inflateToSink(&sink, strm, p, toProcess, outBuffer, bufferCapacity, &consumed);
+                    int zRet =
+                        inflate_to_sink(&reader.sink, reader.strm, p, toProcess, reader.outBuffer, bufferCapacity,
+                                      &consumed);
                     if (zRet < 0) {
                         return push_error(L, "inflate error");
                     }
@@ -518,28 +545,28 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
                     }
                     toProcess = consumed;
                 } else {
-                    sinkEmit(&sink, (const char*)p, toProcess);
+                    sink_emit(&reader.sink, (const char*)p, toProcess);
                 }
 
-                sink.totalBytesRead += toProcess;
+                reader.sink.totalBytesRead += toProcess;
                 chunkBytesRemaining -= toProcess;
                 cacheOff += toProcess;
 
-                sinkProgress(&sink, (size_t)-1); // unknown total for chunked
+                sink_progress(&reader.sink, LCOREHTTP_CONTENT_LENGTH_UNKNOWN); // unknown total for chunked
 
                 if (chunkBytesRemaining == 0) {
-                    state = 2;
+                    state = LCOREHTTP_CHUNK_TRAILER;
                 }
                 madeProgress = 1;
             }
 
-        } else if (state == 2) { // Trailing CRLF
+        } else if (state == LCOREHTTP_CHUNK_TRAILER) {
             if (available >= 2) {
                 if (p[0] != '\r' || p[1] != '\n') {
                     return push_error(L, "expected CRLF after chunk");
                 }
                 cacheOff += 2;
-                state = 0;
+                state = LCOREHTTP_CHUNK_HEADER;
                 madeProgress = 1;
             }
         }
@@ -557,7 +584,7 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
         if (cacheOff > 0) {
             size_t remaining = cacheLen - cacheOff;
             if (remaining > 0) {
-                memmove(buffer, buffer + cacheOff, remaining);
+                memmove(reader.buffer, reader.buffer + cacheOff, remaining);
             }
             cacheLen = remaining;
             cacheOff = 0;
@@ -565,13 +592,13 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
 
         // Calculate how much we NEED to read (not the whole buffer!)
         size_t bytesNeeded = 0;
-        if (state == 0) {
+        if (state == LCOREHTTP_CHUNK_HEADER) {
             // Header: Minimum is "0\r\n" = 3 bytes
             bytesNeeded = 3;
-        } else if (state == 1) {
+        } else if (state == LCOREHTTP_CHUNK_DATA) {
             // Data: We need the remaining chunk bytes + 2 for CRLF + 5 for next header ("0\r\n" = 3, typical = 5)
             bytesNeeded = chunkBytesRemaining + 5;
-        } else if (state == 2) {
+        } else if (state == LCOREHTTP_CHUNK_TRAILER) {
             // CRLF: We need exactly 2 bytes
             bytesNeeded = 2;
         }
@@ -584,8 +611,8 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
         size_t toRead = (bytesNeeded < spaceAvailable) ? bytesNeeded : spaceAvailable;
 
         size_t readAmt = 0;
-        int ret = l_corehttp_response_read_internal(response, buffer + cacheLen, toRead, &readAmt);
-        if (ret != 0) {
+        int ret = l_corehttp_response_read_internal(response, reader.buffer + cacheLen, toRead, &readAmt);
+        if (ret != LCOREHTTP_READ_OK) {
             return push_error(L, "network error");
         }
 
@@ -596,45 +623,35 @@ l_corehttp_response_read_chunked_content(lua_State* L) {
         cacheLen += readAmt;
     }
 
-    if (hasWriteFunc) {
-        lua_pushinteger(L, sink.totalBytesRead);
-    } else {
-        luaL_pushresult(&sink.buffer);
-    }
-
-    return 1;
+    return reader_finish(L, &reader);
 }
+
+static const luaL_Reg lcorehttp_response_methods[] = {
+    {"headers", l_corehttp_response_headers},
+    {"status", l_corehttp_response_status},
+    {"status_code", l_corehttp_response_status_code},
+    {"http_status_code", l_corehttp_response_http_status_code},
+    {"read", l_corehttp_response_read},
+    {"read_content", l_corehttp_response_read_content},
+    {"read_chunked_content", l_corehttp_response_read_chunked_content},
+    {NULL, NULL}};
+
+static const luaL_Reg lcorehttp_response_metamethods[] = {
+    {"__tostring", l_corehttp_response_tostring},
+    {"__gc", l_corehttp_response_gc},
+    {"__close", l_corehttp_response_gc},
+    {NULL, NULL}};
 
 int
 l_corehttp_response_create_meta(lua_State* L) {
     luaL_newmetatable(L, LCOREHTTP_RESPONSE_METATABLE);
-    /* Metamethods */
+    luaL_setfuncs(L, lcorehttp_response_metamethods, 0);
+
     lua_newtable(L);
-    lua_pushcfunction(L, l_corehttp_response_tostring);
-    lua_setfield(L, -2, "__tostring");
-    lua_pushcfunction(L, l_corehttp_response_headers);
-    lua_setfield(L, -2, "headers");
-    lua_pushcfunction(L, l_corehttp_response_status);
-    lua_setfield(L, -2, "status");
-    lua_pushcfunction(L, l_corehttp_response_status_code);
-    lua_setfield(L, -2, "status_code");
-    lua_pushcfunction(L, l_corehttp_response_http_status_code);
-    lua_setfield(L, -2, "http_status_code");
-    lua_pushcfunction(L, l_corehttp_response_read);
-    lua_setfield(L, -2, "read");
-    lua_pushcfunction(L, l_corehttp_response_read_content);
-    lua_setfield(L, -2, "read_content");
-    lua_pushcfunction(L, l_corehttp_response_read_chunked_content);
-    lua_setfield(L, -2, "read_chunked_content");
+    luaL_setfuncs(L, lcorehttp_response_methods, 0);
     lua_pushstring(L, LCOREHTTP_RESPONSE_METATABLE);
     lua_setfield(L, -2, "__type");
-    /* Metamethods */
     lua_setfield(L, -2, "__index");
-
-    lua_pushcfunction(L, l_corehttp_response_gc);
-    lua_setfield(L, -2, "__gc");
-    lua_pushcfunction(L, l_corehttp_response_gc);
-    lua_setfield(L, -2, "__close");
 
     return 0;
 }
@@ -648,8 +665,11 @@ l_corehttp_response_headers_get(lua_State* L) {
 
     lua_pushnil(L);
     while (lua_next(L, 1) != 0) {
-        const char* key = lua_tostring(L, -2);
-        if (strcasecmp(key, headerName) == 0) {
+        lua_pushvalue(L, -2);
+        const char* key = lua_tostring(L, -1);
+        int matched = key != NULL && strcasecmp(key, headerName) == 0;
+        lua_pop(L, 1); // key copy
+        if (matched) {
             return 1;
         }
         lua_pop(L, 1); // pop value

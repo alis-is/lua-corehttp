@@ -18,6 +18,9 @@ typedef struct lcorehttp_response {
 #define LCOREHTTP_RESPONSE_METATABLE "COREHTTP_RESPONSE"
 #define LCOREHTTP_HEADERS_METATABLE  "COREHTTP_HEADERS"
 
+// Body length is unknown up front (close-delimited or chunked transfer).
+#define LCOREHTTP_CONTENT_LENGTH_UNKNOWN ((size_t)-1)
+
 int l_corehttp_response_create_meta(lua_State* L);
 int l_corehttp_response_headers_create_meta(lua_State* L);
 lcorehttp_response* l_corehttp_new_response(lua_State* L);
